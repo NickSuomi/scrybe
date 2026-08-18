@@ -51,6 +51,25 @@ function mergeRrf(lists: SearchResult[][], k: number): SearchResult[] {
     .map(([id, score]) => ({ ...byId.get(id)!, score }));
 }
 
+function compareSearchResults(a: SearchResult, b: SearchResult): number {
+  if (a.score !== b.score) return b.score - a.score;
+  if (a.source_id !== b.source_id) return a.source_id < b.source_id ? -1 : 1;
+  return a.chunk_id < b.chunk_id ? -1 : a.chunk_id > b.chunk_id ? 1 : 0;
+}
+
+function mergeByScore(lists: SearchResult[][]): SearchResult[] {
+  const byId = new Map<string, SearchResult>();
+  for (const list of lists) {
+    for (const result of list) {
+      const existing = byId.get(result.chunk_id);
+      if (!existing || compareSearchResults(result, existing) < 0) {
+        byId.set(result.chunk_id, result);
+      }
+    }
+  }
+  return [...byId.values()].sort(compareSearchResults);
+}
+
 function getCodeSources(sources: Source[]): Source[] {
   return sources.filter((s) => {
     try { return getPlugin(s.source_config.type).embeddingProfile === "code"; }
@@ -152,6 +171,7 @@ export async function searchCode(
       .filter((s) => s.table_name)
       .map(async (source) => {
         const embConfig = resolveEmbeddingConfig(source);
+        const embeddingKey = queryEmbeddingConfigKey(embConfig);
         const tableName = source.table_name!;
 
         // Resolve branch for this source.
@@ -172,7 +192,12 @@ export async function searchCode(
             if (process.env.SCRYBE_DEBUG_SEARCH === "1") {
               console.debug(`[scrybe:search] branch "${sourceBranch}" unresolved for source ${source.source_id} (project ${projectId}) — returning []`);
             }
-            return [] as SearchResult[];
+            return {
+              embeddingKey,
+              results: [] as SearchResult[],
+              vectorResults: [] as SearchResult[],
+              ftsResults: [] as SearchResult[],
+            };
           }
           const ids = getChunkIdsForBranch(projectId, source.source_id, resolvedBranch);
           if (ids.size <= BRANCH_FILTER_INLINE_LIMIT) {
@@ -184,11 +209,12 @@ export async function searchCode(
 
         const queryVec = await embedQueryOnce(query, embConfig, queryEmbeddings);
 
-        let results: SearchResult[];
+        let vectorResults: SearchResult[];
+        let ftsResults: SearchResult[] = [];
         if (!config.hybridEnabled) {
-          results = await search(queryVec, projectId, fetchCount, tableName, embConfig.dimensions, inlineIds);
+          vectorResults = await search(queryVec, projectId, fetchCount, tableName, embConfig.dimensions, inlineIds);
         } else {
-          const [vectorResults, ftsResults] = await Promise.all([
+          [vectorResults, ftsResults] = await Promise.all([
             search(queryVec, projectId, fetchCount, tableName, embConfig.dimensions, inlineIds),
             ftsSearch(query, projectId, fetchCount, tableName, inlineIds).catch((err: unknown) => {
               const msg = err instanceof Error ? err.message : String(err);
@@ -196,21 +222,48 @@ export async function searchCode(
               throw err;
             }),
           ]);
-
-          results = ftsResults.length === 0 ? vectorResults : mergeRrf([vectorResults, ftsResults], config.rrfK);
         }
 
         // Post-filter for large branch sets (> BRANCH_FILTER_INLINE_LIMIT chunk_ids)
         if (postFilterIds) {
-          results = results.filter((r) => postFilterIds!.has(r.chunk_id));
+          vectorResults = vectorResults.filter((r) => postFilterIds!.has(r.chunk_id));
+          ftsResults = ftsResults.filter((r) => postFilterIds!.has(r.chunk_id));
         }
 
+        const results = ftsResults.length === 0
+          ? vectorResults
+          : mergeRrf([vectorResults, ftsResults], config.rrfK);
+        const withSource = (sourceResults: SearchResult[]) =>
+          sourceResults.map((r) => ({ ...r, source_id: source.source_id, branches: [] as string[] }));
+
         // Thread source_id onto each result before the cross-source merge
-        return results.map((r) => ({ ...r, source_id: source.source_id, branches: [] as string[] }));
+        return {
+          embeddingKey,
+          results: withSource(results),
+          vectorResults: withSource(vectorResults),
+          ftsResults: withSource(ftsResults),
+        };
       })
   );
 
-  const merged = allResults.length === 1 ? allResults[0] : mergeRrf(allResults, config.rrfK);
+  const nonEmptyResults = allResults.filter((entry) => entry.results.length > 0);
+  // Vector-store scores are cosine similarities (1 - cosine distance), so they
+  // are comparable only for the same resolved embedding configuration.
+  const canMergeVectorsByScore = nonEmptyResults.length > 1 && nonEmptyResults.every((entry) =>
+    entry.embeddingKey === nonEmptyResults[0].embeddingKey &&
+    entry.vectorResults.every((result) => Number.isFinite(result.score))
+  );
+  const merged = nonEmptyResults.length === 0
+    ? []
+    : canMergeVectorsByScore
+      ? (() => {
+        const vectors = mergeByScore(nonEmptyResults.map((entry) => entry.vectorResults));
+        const fts = mergeRrf(nonEmptyResults.map((entry) => entry.ftsResults), config.rrfK);
+        return fts.length === 0 ? vectors : mergeRrf([vectors, fts], config.rrfK);
+      })()
+      : nonEmptyResults.length === 1
+        ? nonEmptyResults[0].results
+        : mergeRrf(nonEmptyResults.map((entry) => entry.results), config.rrfK);
 
   let finalResults: SearchResult[];
   if (!config.rerankEnabled || merged.length === 0) {

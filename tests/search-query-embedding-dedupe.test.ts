@@ -11,6 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   project: undefined as any,
   configs: new Map<string, any>(),
+  results: new Map<string, Array<{ chunk_id: string; content: string; score: number }>>(),
 }));
 const initialSkipMigration = process.env.SCRYBE_SKIP_MIGRATION;
 
@@ -37,9 +38,12 @@ vi.mock("../src/embedder.js", () => ({
 }));
 
 vi.mock("../src/vector-store.js", () => ({
-  search: vi.fn(async (_query: number[], _projectId: string, _limit: number, tableName: string) => [
-    { chunk_id: `code-${tableName}`, content: tableName },
-  ]),
+  search: vi.fn(async (_query: number[], _projectId: string, _limit: number, tableName: string) => {
+    const configuredResults = state.results.get(tableName);
+    if (configuredResults) return configuredResults;
+    const score = tableName === "table_ionic" ? 0.91 : 0.42;
+    return [{ chunk_id: `code-${tableName}`, content: tableName, score }];
+  }),
   ftsSearch: vi.fn(),
   searchKnowledge: vi.fn(async (_query: number[], _projectId: string, _limit: number, tableName: string) => [
     { project_id: "project", source_id: "", item_path: tableName, content: tableName, item_type: "document" },
@@ -83,6 +87,7 @@ beforeEach(() => {
   vi.clearAllMocks();
   state.project = undefined;
   state.configs.clear();
+  state.results.clear();
   process.env.SCRYBE_SKIP_MIGRATION = "1";
 });
 
@@ -145,6 +150,116 @@ describe("searchCode query embedding fan-out", () => {
     await searchCode("find API authentication", "code-project");
 
     expect(embedQuery).toHaveBeenCalledTimes(2);
+  });
+
+  it("ranks equal-config sources by semantic score instead of source order", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("cmx", "code"), source("node-services", "code"), source("ionic", "code")],
+    };
+    for (const sourceId of ["cmx", "node-services", "ionic"]) state.configs.set(sourceId, embeddingConfig());
+
+    const { searchCode } = await import("../src/search.js");
+    const results = await searchCode("find feedback widget PII", "code-project");
+
+    expect(results.map((result) => result.source_id)).toEqual(["ionic", "cmx", "node-services"]);
+  });
+
+  it("interleaves equal-config source results by semantic score", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("cmx", "code"), source("ionic", "code")],
+    };
+    for (const sourceId of ["cmx", "ionic"]) state.configs.set(sourceId, embeddingConfig());
+    state.results.set("table_cmx", [
+      { chunk_id: "cmx-high", content: "cmx high", score: 0.8 },
+      { chunk_id: "cmx-low", content: "cmx low", score: 0.4 },
+    ]);
+    state.results.set("table_ionic", [
+      { chunk_id: "ionic-high", content: "ionic high", score: 0.91 },
+      { chunk_id: "ionic-low", content: "ionic low", score: 0.55 },
+    ]);
+
+    const { searchCode } = await import("../src/search.js");
+    const results = await searchCode("find feedback widget PII", "code-project");
+
+    expect(results.map((result) => result.chunk_id)).toEqual(["ionic-high", "cmx-high", "ionic-low", "cmx-low"]);
+  });
+
+  it("keeps rank fusion when source embedding configurations differ", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("cmx", "code"), source("ionic", "code")],
+    };
+    state.configs.set("cmx", embeddingConfig());
+    state.configs.set("ionic", embeddingConfig({ model: "other-embedding-model" }));
+
+    const { searchCode } = await import("../src/search.js");
+    const results = await searchCode("find feedback widget PII", "code-project");
+
+    expect(results.map((result) => result.source_id)).toEqual(["cmx", "ionic"]);
+  });
+
+  it("ignores an unresolved branch from a differently configured source when ranking matches", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("cmx", "code"), source("ionic", "code"), source("unmatched", "code")],
+    };
+    state.configs.set("cmx", embeddingConfig());
+    state.configs.set("ionic", embeddingConfig());
+    state.configs.set("unmatched", embeddingConfig({ model: "other-embedding-model" }));
+    process.env.SCRYBE_SKIP_MIGRATION = "0";
+
+    const branchState = await import("../src/branch-state.js");
+    vi.mocked(branchState.resolveBranchForSearch).mockImplementation((_projectId, sourceId) =>
+      sourceId === "unmatched" ? null : "main"
+    );
+    vi.mocked(branchState.getChunkIdsForBranch).mockReturnValue(new Set());
+
+    const { searchCode } = await import("../src/search.js");
+    const results = await searchCode("find feedback widget PII", "code-project", { branch: "main" });
+
+    expect(results.map((result) => result.source_id)).toEqual(["ionic", "cmx"]);
+  });
+
+  it("returns no results when every code source is unindexed", async () => {
+    const unindexed = source("unindexed", "code");
+    delete unindexed.table_name;
+    state.project = { id: "code-project", sources: [unindexed] };
+
+    const { searchCode } = await import("../src/search.js");
+
+    await expect(searchCode("find feedback widget PII", "code-project")).resolves.toEqual([]);
+  });
+
+  it("globally ranks hybrid vector results before fusing full-text results", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("cmx", "code"), source("ionic", "code")],
+    };
+    for (const sourceId of ["cmx", "ionic"]) state.configs.set(sourceId, embeddingConfig());
+
+    const configModule = await import("../src/config.js");
+    const vectorStore = await import("../src/vector-store.js");
+    configModule.config.hybridEnabled = true;
+    vi.mocked(vectorStore.ftsSearch).mockImplementation(async (_query, _projectId, _limit, tableName) => [
+      { chunk_id: `fts-${tableName}`, content: "full text match", score: 0 },
+    ] as any);
+
+    try {
+      const { searchCode } = await import("../src/search.js");
+      const results = await searchCode("find feedback widget PII", "code-project");
+
+      expect(results.map((result) => result.chunk_id)).toEqual([
+        "code-table_ionic",
+        "fts-table_cmx",
+        "code-table_cmx",
+        "fts-table_ionic",
+      ]);
+    } finally {
+      configModule.config.hybridEnabled = false;
+      vi.mocked(vectorStore.ftsSearch).mockReset();
+    }
   });
 });
 
