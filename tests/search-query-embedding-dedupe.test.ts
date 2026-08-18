@@ -11,7 +11,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 const state = vi.hoisted(() => ({
   project: undefined as any,
   configs: new Map<string, any>(),
-  results: new Map<string, Array<{ chunk_id: string; content: string; score: number }>>(),
+  results: new Map<string, Array<{ chunk_id: string; content: string; score: number; item_path?: string }>>(),
 }));
 const initialSkipMigration = process.env.SCRYBE_SKIP_MIGRATION;
 
@@ -186,6 +186,104 @@ describe("searchCode query embedding fan-out", () => {
     expect(results.map((result) => result.chunk_id)).toEqual(["ionic-high", "cmx-high", "ionic-low", "cmx-low"]);
   });
 
+  it("prioritizes candidates covering more explicit query terms", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("cmx", "code"), source("ionic", "code")],
+    };
+    for (const sourceId of ["cmx", "ionic"]) state.configs.set(sourceId, embeddingConfig());
+    state.results.set("table_cmx", [
+      { chunk_id: "cmx-generic", content: "A generic widget configuration", score: 0.9 },
+    ]);
+    state.results.set("table_ionic", [
+      {
+        chunk_id: "ionic-feedback-runtime",
+        content: "Sentry feedback widget privacy automatic handling",
+        score: 0.6,
+      },
+    ]);
+
+    const { searchCode } = await import("../src/search.js");
+    const results = await searchCode("feedback widget privacy automatic sentry", "code-project");
+
+    expect(results.map((result) => result.chunk_id)).toEqual(["ionic-feedback-runtime", "cmx-generic"]);
+  });
+
+  it("does not compare full-text scores with vector similarity", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("cmx", "code"), source("ionic", "code")],
+    };
+    for (const sourceId of ["cmx", "ionic"]) state.configs.set(sourceId, embeddingConfig());
+    state.results.set("table_cmx", [
+      {
+        chunk_id: "cmx-vector",
+        item_path: "src/cmx.ts",
+        content: "Sentry feedback widget privacy automatic handling",
+        score: 0.9,
+      },
+    ]);
+    state.results.set("table_ionic", [
+      {
+        chunk_id: "ionic-vector",
+        item_path: "src/ionic.ts",
+        content: "Sentry feedback widget privacy automatic handling",
+        score: 0.8,
+      },
+    ]);
+
+    const configModule = await import("../src/config.js");
+    const vectorStore = await import("../src/vector-store.js");
+    configModule.config.hybridEnabled = true;
+    vi.mocked(vectorStore.ftsSearch).mockImplementation(async (_query, _projectId, _limit, tableName) => [
+      {
+        chunk_id: `fts-${tableName}`,
+        content: "Sentry feedback widget privacy automatic handling",
+        score: 100,
+      },
+    ] as any);
+
+    try {
+      const { searchCode } = await import("../src/search.js");
+      const results = await searchCode("feedback widget privacy automatic sentry", "code-project");
+
+      expect(results.map((result) => result.chunk_id)).toEqual([
+        "cmx-vector",
+        "ionic-vector",
+        "fts-table_cmx",
+        "fts-table_ionic",
+      ]);
+      expect(results.slice(2).map((result) => result.score)).toEqual([0, 0]);
+    } finally {
+      configModule.config.hybridEnabled = false;
+      vi.mocked(vectorStore.ftsSearch).mockReset();
+    }
+  });
+
+  it("caps an over-fetched single-source fallback at the requested limit", async () => {
+    state.project = {
+      id: "code-project",
+      sources: [source("ionic", "code"), source("unmatched", "code")],
+    };
+    for (const sourceId of ["ionic", "unmatched"]) state.configs.set(sourceId, embeddingConfig());
+    state.results.set("table_ionic", [
+      { chunk_id: "ionic-first", content: "feedback widget", score: 0.9 },
+      { chunk_id: "ionic-second", content: "feedback widget", score: 0.8 },
+    ]);
+    process.env.SCRYBE_SKIP_MIGRATION = "0";
+
+    const branchState = await import("../src/branch-state.js");
+    vi.mocked(branchState.resolveBranchForSearch).mockImplementation((_projectId, sourceId) =>
+      sourceId === "unmatched" ? null : "main"
+    );
+    vi.mocked(branchState.getChunkIdsForBranch).mockReturnValue(new Set());
+
+    const { searchCode } = await import("../src/search.js");
+    const results = await searchCode("feedback widget", "code-project", { limit: 1, branch: "main" });
+
+    expect(results.map((result) => result.chunk_id)).toEqual(["ionic-first"]);
+  });
+
   it("keeps rank fusion when source embedding configurations differ", async () => {
     state.project = {
       id: "code-project",
@@ -232,7 +330,7 @@ describe("searchCode query embedding fan-out", () => {
     await expect(searchCode("find feedback widget PII", "code-project")).resolves.toEqual([]);
   });
 
-  it("globally ranks hybrid vector results before fusing full-text results", async () => {
+  it("uses full-text results for recall without displacing stronger vector results", async () => {
     state.project = {
       id: "code-project",
       sources: [source("cmx", "code"), source("ionic", "code")],
@@ -252,8 +350,8 @@ describe("searchCode query embedding fan-out", () => {
 
       expect(results.map((result) => result.chunk_id)).toEqual([
         "code-table_ionic",
-        "fts-table_cmx",
         "code-table_cmx",
+        "fts-table_cmx",
         "fts-table_ionic",
       ]);
     } finally {

@@ -15,6 +15,7 @@ import type { EmbeddingConfig, SearchResult, KnowledgeSearchResult, Source } fro
 import { markCallerFacing } from "./daemon/caller-error.js";
 
 const MAX_RERANK_CANDIDATES = 500;
+const MULTI_SOURCE_FETCH_MULTIPLIER = 10;
 
 // Chunk_ids above this size are handled by JS post-filter instead of SQL IN clause.
 // LanceDB's IN predicate has practical limits; 5000 is conservative.
@@ -51,23 +52,64 @@ function mergeRrf(lists: SearchResult[][], k: number): SearchResult[] {
     .map(([id, score]) => ({ ...byId.get(id)!, score }));
 }
 
-function compareSearchResults(a: SearchResult, b: SearchResult): number {
-  if (a.score !== b.score) return b.score - a.score;
-  if (a.source_id !== b.source_id) return a.source_id < b.source_id ? -1 : 1;
-  return a.chunk_id < b.chunk_id ? -1 : a.chunk_id > b.chunk_id ? 1 : 0;
+function getQueryTerms(query: string): string[] {
+  return [...new Set(query.toLowerCase().match(/[a-z0-9]{3,}/g) ?? [])];
 }
 
-function mergeByScore(lists: SearchResult[][]): SearchResult[] {
-  const byId = new Map<string, SearchResult>();
-  for (const list of lists) {
+function queryTermCoverage(result: SearchResult, terms: string[]): number {
+  const text = `${result.item_path}\n${result.content}`.toLowerCase();
+  return terms.filter((term) => text.includes(term)).length;
+}
+
+interface RelevanceCandidate {
+  result: SearchResult;
+  vectorScore: number | undefined;
+  ftsHit: boolean;
+}
+
+function mergeByRelevance(vectorLists: SearchResult[][], ftsLists: SearchResult[][], query: string): SearchResult[] {
+  const terms = getQueryTerms(query);
+  const candidates = new Map<string, RelevanceCandidate>();
+
+  for (const list of vectorLists) {
     for (const result of list) {
-      const existing = byId.get(result.chunk_id);
-      if (!existing || compareSearchResults(result, existing) < 0) {
-        byId.set(result.chunk_id, result);
+      const existing = candidates.get(result.chunk_id);
+      if (!existing || result.score > (existing.vectorScore ?? Number.NEGATIVE_INFINITY)) {
+        candidates.set(result.chunk_id, { result, vectorScore: result.score, ftsHit: existing?.ftsHit ?? false });
       }
     }
   }
-  return [...byId.values()].sort(compareSearchResults);
+
+  for (const list of ftsLists) {
+    for (const result of list) {
+      const existing = candidates.get(result.chunk_id);
+      if (existing) {
+        existing.ftsHit = true;
+      } else {
+        candidates.set(result.chunk_id, {
+          result: { ...result, score: 0 },
+          vectorScore: undefined,
+          ftsHit: true,
+        });
+      }
+    }
+  }
+
+  return [...candidates.values()]
+    .map((candidate) => ({ candidate, coverage: queryTermCoverage(candidate.result, terms) }))
+    .sort((a, b) => {
+      if (a.coverage !== b.coverage) return b.coverage - a.coverage;
+      const aScore = a.candidate.vectorScore ?? Number.NEGATIVE_INFINITY;
+      const bScore = b.candidate.vectorScore ?? Number.NEGATIVE_INFINITY;
+      if (aScore !== bScore) return bScore - aScore;
+      if (a.candidate.ftsHit !== b.candidate.ftsHit) return a.candidate.ftsHit ? -1 : 1;
+      if (a.candidate.result.source_id !== b.candidate.result.source_id) {
+        return a.candidate.result.source_id < b.candidate.result.source_id ? -1 : 1;
+      }
+      return a.candidate.result.chunk_id < b.candidate.result.chunk_id ? -1 :
+        a.candidate.result.chunk_id > b.candidate.result.chunk_id ? 1 : 0;
+    })
+    .map(({ candidate }) => candidate.result);
 }
 
 function getCodeSources(sources: Source[]): Source[] {
@@ -160,15 +202,22 @@ export async function searchCode(
     throw markCallerFacing(new Error("NO_CODE_SOURCES: Project has no indexed code sources"));
   }
 
+  const searchableCodeSources = codeSources.filter((s) => s.table_name);
+  const embeddingKeys = new Set(searchableCodeSources.map((source) =>
+    queryEmbeddingConfigKey(resolveEmbeddingConfig(source))
+  ));
+  const canPotentiallyMergeByRelevance = searchableCodeSources.length > 1 && embeddingKeys.size === 1;
   const fetchCount = config.rerankEnabled
     ? Math.min(topK * config.rerankFetchMultiplier, MAX_RERANK_CANDIDATES)
-    : topK;
+    : Math.min(
+      topK * (canPotentiallyMergeByRelevance ? MULTI_SOURCE_FETCH_MULTIPLIER : 1),
+      MAX_RERANK_CANDIDATES
+    );
   const queryEmbeddings = new Map<string, Promise<number[]>>();
 
   // Fan out across all code sources in parallel
   const allResults = await Promise.all(
-    codeSources
-      .filter((s) => s.table_name)
+    searchableCodeSources
       .map(async (source) => {
         const embConfig = resolveEmbeddingConfig(source);
         const embeddingKey = queryEmbeddingConfigKey(embConfig);
@@ -249,18 +298,18 @@ export async function searchCode(
   const nonEmptyResults = allResults.filter((entry) => entry.results.length > 0);
   // Vector-store scores are cosine similarities (1 - cosine distance), so they
   // are comparable only for the same resolved embedding configuration.
-  const canMergeVectorsByScore = nonEmptyResults.length > 1 && nonEmptyResults.every((entry) =>
+  const canMergeByRelevance = nonEmptyResults.length > 1 && nonEmptyResults.every((entry) =>
     entry.embeddingKey === nonEmptyResults[0].embeddingKey &&
     entry.vectorResults.every((result) => Number.isFinite(result.score))
   );
   const merged = nonEmptyResults.length === 0
     ? []
-    : canMergeVectorsByScore
-      ? (() => {
-        const vectors = mergeByScore(nonEmptyResults.map((entry) => entry.vectorResults));
-        const fts = mergeRrf(nonEmptyResults.map((entry) => entry.ftsResults), config.rrfK);
-        return fts.length === 0 ? vectors : mergeRrf([vectors, fts], config.rrfK);
-      })()
+    : canMergeByRelevance
+      ? mergeByRelevance(
+        nonEmptyResults.map((entry) => entry.vectorResults),
+        nonEmptyResults.map((entry) => entry.ftsResults),
+        query
+      )
       : nonEmptyResults.length === 1
         ? nonEmptyResults[0].results
         : mergeRrf(nonEmptyResults.map((entry) => entry.results), config.rrfK);
