@@ -17,6 +17,7 @@ export interface EmbeddingStatusSnapshot {
   api_key_present: boolean;
   config_error: boolean;
   config_error_message: string | null;
+  credential_error_message: string | null;
 }
 
 function providerType(provider: string): "local" | "api" {
@@ -30,7 +31,7 @@ export function configuredEmbeddingStatus(): EmbeddingStatusSnapshot {
   } catch (err: any) {
     const message = err instanceof Error ? err.message : String(err);
     return {
-      config_present: false,
+      config_present: true,
       code_provider_type: "",
       code_model: "",
       text_provider_type: "",
@@ -38,12 +39,28 @@ export function configuredEmbeddingStatus(): EmbeddingStatusSnapshot {
       api_key_present: false,
       config_error: true,
       config_error_message: message,
+      credential_error_message: null,
     };
   }
   if (scrybeConfig !== null) {
     try {
-      const code = resolvePreset(scrybeConfig.assignments.code_preset, "code_preset", scrybeConfig);
-      const text = resolvePreset(scrybeConfig.assignments.text_preset, "text_preset", scrybeConfig);
+      const code = resolvePreset(scrybeConfig.assignments.code_preset, "code_preset", scrybeConfig, { resolveCredentials: false });
+      const text = resolvePreset(scrybeConfig.assignments.text_preset, "text_preset", scrybeConfig, { resolveCredentials: false });
+      let apiKeyPresent = code.provider === "local";
+      const credentialErrors: string[] = [];
+      for (const [slot, name] of [
+        ["code_preset", scrybeConfig.assignments.code_preset],
+        ["text_preset", scrybeConfig.assignments.text_preset],
+      ] as const) {
+        try {
+          const resolved = resolvePreset(name, slot, scrybeConfig);
+          if (slot === "code_preset") {
+            apiKeyPresent = resolved.provider === "local" || resolved.credentials.length > 0;
+          }
+        } catch (err) {
+          credentialErrors.push(`${slot}: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
       return {
         config_present: true,
         code_provider_type: providerType(code.provider),
@@ -53,9 +70,10 @@ export function configuredEmbeddingStatus(): EmbeddingStatusSnapshot {
         // This means the selected code preset's credential reference resolved.
         // A local OpenAI-compatible server may deliberately use a non-secret
         // sentinel value such as "not-needed".
-        api_key_present: code.provider === "local" || code.credentials.length > 0,
+        api_key_present: apiKeyPresent,
         config_error: false,
         config_error_message: null,
+        credential_error_message: credentialErrors.length > 0 ? credentialErrors.join("; ") : null,
       };
     } catch (err: any) {
       const message = err instanceof Error ? err.message : String(err);
@@ -68,6 +86,7 @@ export function configuredEmbeddingStatus(): EmbeddingStatusSnapshot {
         api_key_present: false,
         config_error: true,
         config_error_message: message,
+        credential_error_message: null,
       };
     }
   }
@@ -81,5 +100,6 @@ export function configuredEmbeddingStatus(): EmbeddingStatusSnapshot {
     api_key_present: !!config.embeddingApiKey,
     config_error: !!config.embeddingConfigError,
     config_error_message: config.embeddingConfigError ?? null,
+    credential_error_message: null,
   };
 }

@@ -1,4 +1,6 @@
 import { describe, expect, it, vi } from "vitest";
+import { writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 vi.mock("../src/onboarding/validate-provider.js", () => ({
   validateProvider: vi.fn(async () => ({ ok: true, dimensions: 1024, encodingFormat: "float" })),
@@ -6,15 +8,25 @@ vi.mock("../src/onboarding/validate-provider.js", () => ({
 }));
 
 describe("embedding configuration input validation", () => {
+  it.each(["credentials", "credentials_from"])("keeps malformed %s as a config error", async (field) => {
+    const { readScrybeConfig, config } = await import("../src/config.js");
+    writeFileSync(join(config.dataDir, "config.json"), JSON.stringify({ schema_version: 1,
+      embedding_presets: { local: { provider: "local", model: "Xenova/multilingual-e5-small", [field]: 42 } },
+      assignments: { code_preset: "local", text_preset: "local" },
+    }));
+    expect(() => readScrybeConfig()).toThrow(`${field} must be a string`);
+  });
+
   it("rejects an explicit base64 setting that cannot force SDK decoding", async () => {
-    const { validateScrybeConfig } = await import("../src/config.js");
-    expect(validateScrybeConfig({
+    const { readScrybeConfig, config } = await import("../src/config.js");
+    writeFileSync(join(config.dataDir, "config.json"), JSON.stringify({
       schema_version: 1,
       embedding_presets: {
         custom: { provider: "custom", model: "qwen", base_url: "http://localhost/v1", dim: 1024, encoding_format: "base64" },
       },
       assignments: { code_preset: "custom", text_preset: "custom" },
-    })).toContain('encoding_format must be "float"');
+    }));
+    expect(() => readScrybeConfig()).toThrow('encoding_format must be "float"');
   });
 
   it.each([
@@ -23,8 +35,7 @@ describe("embedding configuration input validation", () => {
   ])("rejects encoding for a non-custom init provider %j", async (input) => {
     const { initTool } = await import("../src/tools/init-mcp.js");
     const result = await initTool.handler(input);
-    expect(result.ok).toBe(false);
-    expect(result.error).toContain("only valid");
+    expect(result).toMatchObject({ ok: false, error: expect.stringContaining("only valid") });
   });
 
   it("infers dimensions and persists float encoding during custom init", async () => {

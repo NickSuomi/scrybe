@@ -17,7 +17,7 @@ export interface EmbeddingConfig {
    * base64 default; set to "float" for compatible local servers that return
    * JSON float arrays rather than base64.
    */
-  encoding_format?: "float" | "base64";
+  encoding_format?: "float";
   /**
    * Per-preset maximum input token budget (Plan 77).
    * When set, derives a char cap of `max_input_tokens * 4` (heuristic).

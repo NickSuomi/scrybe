@@ -266,6 +266,10 @@ export function runPresetAdd(opts: PresetAddOptions): void {
     };
   }
 
+  if (Object.hasOwn(cfg.embedding_presets, name)) {
+    throw new Error(`Preset '${name}' already exists. Edit its config.json entry, or add a new preset and assign it.`);
+  }
+
   // Build the preset
   const preset: EmbeddingPreset = { provider, model };
   if (credentials) preset.credentials = credentials;

@@ -83,7 +83,7 @@ function queryEmbeddingConfigKey(embedding: EmbeddingConfig): string {
     prompt_template: embedding.prompt_template,
     encoding_format: embedding.encoding_format,
     max_input_tokens: embedding.max_input_tokens,
-  });
+  } satisfies Record<keyof EmbeddingConfig, unknown>);
 }
 
 /**

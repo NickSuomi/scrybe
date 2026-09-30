@@ -13,7 +13,7 @@ import type { Tool } from "./types.js";
 export interface StatusOutput {
   /** Scrybe version from package.json. */
   version: string;
-  /** True when config.json exists and is well-formed. */
+  /** True when config.json exists, including when it is malformed. */
   config_present: boolean;
   /** True when the daemon pidfile exists and the process is alive. */
   daemon_running: boolean;
@@ -31,12 +31,14 @@ export interface StatusOutput {
   text_provider_type: string;
   /** Embedding model for knowledge sources. */
   text_model: string;
-  /** True when SCRYBE_CODE_EMBEDDING_API_KEY is set (API providers only). */
+  /** True when the assigned code preset's credential resolves, or it uses the local embedder. */
   api_key_present: boolean;
   /** True when there is a config error (misconfigured provider). */
   config_error: boolean;
   /** Config error message when config_error is true, otherwise null. */
   config_error_message: string | null;
+  /** Credential resolution error, independent of JSON and preset validity. */
+  credential_error_message: string | null;
 }
 
 // ─── Tool definition ──────────────────────────────────────────────────────────

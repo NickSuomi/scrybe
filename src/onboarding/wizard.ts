@@ -480,7 +480,6 @@ export async function runWizard(opts?: WizardOptions): Promise<void> {
 
     // Probe /models — retry on 401
     let model = "";
-    let dim: number | undefined;
 
     const probeResult = await probeModelsEndpoint(baseUrl, apiKey);
     if (probeResult && probeResult.status === 401) {
@@ -511,26 +510,23 @@ export async function runWizard(opts?: WizardOptions): Promise<void> {
       model = modelInput as string;
     }
 
-    const dimInput = await p.text({
-      message: "Embedding dimensions (e.g. 768)",
-      validate: (v) => (v && /^\d+$/.test(v) ? undefined : "Must be a positive integer"),
-    });
-    if (p.isCancel(dimInput)) return null;
-    dim = parseInt(dimInput as string, 10);
-
-    const useFloatEncoding = await p.confirm({
-      message: "Does this endpoint return JSON float arrays instead of the OpenAI-compatible default?",
-      initialValue: false,
-    });
-    if (p.isCancel(useFloatEncoding)) return null;
+    const spinner = p.spinner();
+    spinner.start("Validating embedding model...");
+    const result = await validateProvider({ baseUrl, model, apiKey, encodingFormat: "float" });
+    if (!result.ok) {
+      spinner.stop("Embedding validation failed");
+      p.log.warn(result.message ?? "The endpoint did not return valid embeddings.");
+      return null;
+    }
+    spinner.stop(`Embedding model valid — ${result.dimensions}d`);
 
     return {
       provider: "custom",
       apiKey,
       model,
       baseUrl,
-      dim,
-      encodingFormat: useFloatEncoding ? "float" : undefined,
+      dim: result.dimensions,
+      encodingFormat: result.encodingFormat,
     };
   }
 

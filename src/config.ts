@@ -590,7 +590,7 @@ export interface EmbeddingPreset {
    * Leave unset for the SDK's backward-compatible base64 default. Local
    * servers that return JSON float arrays can opt in to "float".
    */
-  encoding_format?: "float" | "base64";
+  encoding_format?: "float";
   /**
    * Per-preset asymmetric prompt templates (Plan 77 / Plan 70).
    * When set, the query string is prepended with `query` before embedding,
@@ -666,8 +666,13 @@ function validateScrybeConfig(obj: unknown): string | null {
     if (p["max_input_tokens"] !== undefined && typeof p["max_input_tokens"] !== "number") {
       return `config.json: embedding_presets.${name}.max_input_tokens must be a number`;
     }
-    if (p["encoding_format"] !== undefined && p["encoding_format"] !== "float" && p["encoding_format"] !== "base64") {
-      return `config.json: embedding_presets.${name}.encoding_format must be "float" or "base64"`;
+    for (const field of ["credentials", "credentials_from"]) {
+      if (p[field] !== undefined && typeof p[field] !== "string") {
+        return `config.json: embedding_presets.${name}.${field} must be a string`;
+      }
+    }
+    if (p["encoding_format"] !== undefined && p["encoding_format"] !== "float") {
+      return `config.json: embedding_presets.${name}.encoding_format must be "float"; omit it for the SDK base64 default`;
     }
     if (p["encoding_format"] !== undefined && p["provider"] !== "custom") {
       return `config.json: embedding_presets.${name}.encoding_format is only valid for a custom provider`;
