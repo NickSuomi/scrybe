@@ -11,7 +11,7 @@ scrybe daemon start
         ↓
 src/daemon/main.ts          ← long-running process, pidfile, signal handlers
         ↓
-src/daemon/http-server.ts   ← HTTP API on 127.0.0.1:58451 (ephemeral fallback)
+src/daemon/http-server.ts   ← HTTP API on 127.0.0.1:58451 (fallback port if taken/reserved)
         ↓ events
 @parcel/watcher             ← FS watcher per code source (file changes → reindex)
 .git/ watcher               ← HEAD / refs changes → branch-switch + commit reindex
@@ -45,7 +45,7 @@ scrybe daemon stop
 scrybe daemon restart
 ```
 
-The daemon writes a pidfile at `<DATA_DIR>/daemon.pid` containing `{pid, port, startedAt, version, dataDir, execPath}`. The port is ephemeral if `58451` is taken — clients always read the port from the pidfile.
+The daemon writes a pidfile at `<DATA_DIR>/daemon.pid` containing `{pid, port, startedAt, version, dataDir, execPath}`. The port is ephemeral if `58451` is taken or reserved by the OS (Windows Hyper-V/WSL port exclusion ranges are a common cause) — clients always read the port from the pidfile.
 
 **One daemon per data directory.** Startup is serialised, and a daemon that finds another already responsible for its data directory exits immediately rather than coming up on a second port. Port fallback still applies to daemons on genuinely separate data directories — the data directory, not the port, is what decides whether two daemons may coexist.
 
@@ -122,6 +122,8 @@ Base URL: `http://127.0.0.1:<port>` — port discovered from `<DATA_DIR>/daemon.
 
 All requests and responses use JSON. `/events` is SSE (`text/event-stream`). Unauthenticated on loopback only.
 
+**Host and Origin validation:** Every request is validated against the `Host` header (hostname only; port is ignored), which must match `localhost`, `127.0.0.1`, or a name listed in `SCRYBE_DAEMON_ALLOWED_HOSTS` (comma-separated, case-insensitive; entries with a port, brackets, a slash, a colon or a non-ASCII character are ignored with a warning, so IPv6 literals cannot be allowlisted). A request that also carries an `Origin` header, any value at all, is rejected, since only a browser sends one. A rejected request gets `403 Forbidden` and response body `{ "error": "forbidden" }`, and a line with the reason (`missing-host`, `foreign-host`, or `origin-present`) and the request path is printed to the daemon's standard output. That output is visible when the daemon runs in the foreground or as an installed service (for example in `journalctl --user -u scrybe`); a daemon started on demand discards it.
+
 ### `GET /health`
 
 ```json
@@ -187,11 +189,28 @@ Error responses: `400 invalid_source_type` (non-code source), `404 project_not_f
 
 ---
 
-## MCP-RPC transport (Contract 20)
+## MCP transport (Contract 20)
 
-The daemon exposes two endpoints for MCP communication:
+The daemon exposes endpoints for MCP communication via two different wire formats:
 
-### `GET /mcp/manifest`
+- `/mcp` — **Streamable HTTP protocol (spec-compliant).** Use this for remote and containerized clients. Enabled with `SCRYBE_DAEMON_MCP_HTTP=1` (or `true`).
+- `/mcp/manifest` and `/mcp/rpc` — **Internal private protocol.** Used by the stdio shim. Not intended for third-party clients.
+
+### `POST /mcp` (Streamable HTTP)
+
+**Enabled only when** `SCRYBE_DAEMON_MCP_HTTP` is `1` or `true`. When disabled, this endpoint returns `404`.
+
+`/mcp` speaks the standard MCP Streamable HTTP protocol: a `POST` body is a JSON-RPC 2.0 request using the spec's own methods (`initialize`, `tools/list`, `tools/call`), and the response is a JSON-RPC 2.0 result in the spec's own shape. This is a different wire format from `/mcp/rpc` below — same tools, different request and response shapes — so a client written against `/mcp/rpc` cannot be pointed at `/mcp` without changes. `GET` and `DELETE` answer `405 Method Not Allowed`. No session IDs or SSE stream. Every request is handled by a fresh transport and MCP `Server` instance.
+
+**Tool surface:** Every MCP tool, the same set as stdio, dispatched through the same underlying validation and error-handling path as `/mcp/rpc`. A failing tool call comes back as a normal `tools/call` result with `isError: true` and the error text, exactly as over stdio. Tools answer exactly as over stdio: the reindex tools return their `job_id` at once, while `index_ephemeral` and `drop_ephemeral` wait for their job before answering.
+
+See the [MCP Reference](./mcp-reference.md#mcp-over-http) for security and setup notes.
+
+### Internal: `GET /mcp/manifest` and `POST /mcp/rpc`
+
+These are the private wire format used by the stdio shim. Third-party clients should use `/mcp` (above) instead.
+
+#### `GET /mcp/manifest`
 
 Returns the list of available tools and the daemon version.
 
@@ -225,7 +244,7 @@ Returns the list of available tools and the daemon version.
 
 **Used by:** MCP shim at `initialize` handshake to fetch the current tool surface and version. Cached per connection lifetime.
 
-### `POST /mcp/rpc`
+#### `POST /mcp/rpc`
 
 Dispatch a tool call to the daemon. Request body is a JSON-RPC 2.0 request; response is JSON-RPC 2.0 result or error.
 
@@ -281,7 +300,7 @@ X-Scrybe-Client-Id: <hostname>:<pid>:<timestamp>
 
 Daemon logs this for per-client tracing. Not required, but recommended for debugging multi-client scenarios (VS Code + Claude Code on the same machine).
 
-### Version handshake
+#### Version handshake
 
 `initialize` is answered immediately, with no daemon work at all. The version handshake happens later — the first time the tool list is actually needed (a `tools/list`, or a `tools/call` if one arrives first) — and again whenever the shim re-checks a daemon it is not currently being served by. At that point the shim:
 1. Fetches `GET /mcp/manifest`
@@ -328,7 +347,7 @@ client.close(); // abort any open SSE stream
 
 | Variable | Default | Description |
 |---|---|---|
-| `SCRYBE_DAEMON_PORT` | `58451` | Exact HTTP port to bind (no fallback). When unset, the daemon reuses its previous port from the pidfile, then the default, then an ephemeral port |
+| `SCRYBE_DAEMON_PORT` | `58451` | Exact HTTP port to bind (no fallback). If that port is unavailable — taken or reserved by the OS — the daemon fails to start rather than falling back. When unset, the daemon reuses its previous port from the pidfile, then the default, then an ephemeral port |
 | `SCRYBE_DAEMON_PIDFILE` | `<DATA_DIR>/daemon.pid` | Override pidfile location |
 | `SCRYBE_DAEMON_HOT_MS` | `60000` | HOT window duration in ms |
 | `SCRYBE_DAEMON_COLD_MULTIPLIER` | `5` | Debounce multiplier in COLD state |
@@ -429,9 +448,11 @@ The same path also fires on a new commit on the current branch (`branchChanged: 
 ## Architecture notes for M-D3 (VS Code extension)
 
 - **Spawn pattern:** extension should spawn `scrybe daemon start` detached (`stdio: "ignore"`, `unref()`). Daemon survives VS Code close.
-- **Port discovery:** read `<DATA_DIR>/daemon.pid` for the port; fall back to `SCRYBE_DAEMON_PORT` env var.
+- **Port discovery:** read `<DATA_DIR>/daemon.pid` for the port. Do not fall back to the `SCRYBE_DAEMON_PORT` env var — the daemon may not be bound to it (fallback ports, or a reserved-port failure).
 - **Focus ping:** POST `/kick` (no body) when the VS Code window gains focus to extend the HOT window.
 - **Health check on activation:** if `/health` fails, start the daemon.
 - **MCP config:** extension auto-writes `~/.claude.json` `mcpServers.scrybe` entry on first activation.
 
 Cross-stub contracts 14–19 (HTTP surface, DaemonClient, env vars, test helpers, JSONL log, install scripts) are frozen as of v0.15.0 — additions are allowed, field renames/removals require an API version bump.
+
+**Exception (#102):** the `Access-Control-Allow-Origin: *` response header was removed, and any request carrying an `Origin` header is now refused outright. That is a removal under Contract 14, but it did not get a version bump: the header only ever mattered to a browser reading the response across origins, browsers are now rejected before a response is built at all, and no consumer in this repository ever read that header.

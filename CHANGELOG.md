@@ -20,6 +20,27 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and [Semantic V
 
 ---
 
+## [0.52.0] — 2026-09-24
+
+### Added
+
+- **MCP over HTTP.** The daemon can serve the standard MCP Streamable HTTP transport at `/mcp`, so a client in a container or on another machine can connect without spawning the stdio server. It is off by default: set `SCRYBE_DAEMON_MCP_HTTP=1` (or `true`). Requests are stateless. Every tool available over stdio is exposed and there is no authentication, so put an authenticating reverse proxy in front of anything beyond the local machine. See [mcp-reference.md](docs/mcp-reference.md#mcp-over-http).
+- `SCRYBE_DAEMON_ALLOWED_HOSTS` lets a reverse proxy that forwards its own hostname reach the daemon.
+
+### Security
+
+- The daemon now refuses requests addressed to unexpected host names, any non-GET request from a web page, and any request whose answer a web page could read. Allowed host names are `localhost`, `127.0.0.1` and anything in `SCRYBE_DAEMON_ALLOWED_HOSTS`. Everything else gets `403`. Upgrading is recommended.
+
+---
+
+## [0.51.1] — 2026-08-27
+
+### Fixed
+
+- On Windows, Hyper-V and WSL reserve blocks of TCP ports at boot, and the daemon's usual port can land inside one. It used to refuse to start, with a bare `listen EACCES` and nothing to explain it. It now binds another port and records why it moved, and `doctor` warns when a port it wants has been reserved. Setting `SCRYBE_DAEMON_PORT` still pins the port exactly, so a reserved value there fails rather than falling back, but the message now names the cause.
+
+---
+
 ## [0.51.0] — 2026-08-13
 
 ### Added
@@ -84,42 +105,16 @@ Follows [Keep a Changelog](https://keepachangelog.com/en/1.0.0/) and [Semantic V
 
 ---
 
-## [0.47.1] — 2026-08-01
-
-### Security
-
-- Dependency updates carrying published security fixes: **fast-uri** (host confusion from a literal backslash in the URI authority), **tar** (uncontrolled recursion on crafted long-path archives), and **body-parser** (size limits silently ignored when given an invalid value). All three are transitive dependencies, and scrybe does not exercise the vulnerable paths. Precautionary.
-
-### Changed
-
-- Dependency updates: `@modelcontextprotocol/sdk` 1.30.0, `@parcel/watcher` 2.6.0, `ink` 7.1.1, `ignore` 7.0.6.
-
----
-
-## [0.47.0] — 2026-07-29
-
-### Fixed
-
-- **Only one scrybe daemon can now run per data directory.** Several tools or editor sessions starting at the same moment could each launch their own daemon against the same index — every extra daemon held its own copy of the index in memory, and on one machine four of them together exhausted the host. Startup is now serialised, and a daemon that finds another already responsible for its data directory exits immediately instead of coming up on a second port. Genuinely separate data directories are unaffected.
-- **Upgrading the store is now safe when several scrybe processes start together.** The one-time index upgrade deletes and rebuilds files, and could previously run in more than one process at once — including from an ordinary CLI command. Only one process performs it now; the others wait and then re-check.
-- **Stopping the daemon no longer leaves the pidfile pointing at a live process**, so the next command can still find and talk to a daemon that is finishing its work.
-
-### Changed
-
-- **`scrybe daemon stop` now exits non-zero when the daemon is still running.** It previously reported success whether or not the daemon had actually stopped, so `scrybe daemon stop && …` would carry on with a live daemon behind it — in one case leaving a daemon indexing unattended until it consumed several gigabytes of memory. Exit `0` now means the daemon is confirmed gone; exit `3` means the stop was accepted but the daemon is still finishing in-flight work; exit `1` means it could not be signalled at all. The 30-minute drain and `--force` are unchanged. Scripts that chain off `daemon stop` and need the daemon gone should use `--force`, or retry on exit `3`.
-
----
-
 ## Older releases
 
-For releases v0.46.3 and earlier, see [GitHub Releases](https://github.com/siaarzh/scrybe/releases) (auto-generated from git tags).
+For releases v0.47.1 and earlier, see [GitHub Releases](https://github.com/siaarzh/scrybe/releases) (auto-generated from git tags).
 
 ---
 
-[Unreleased]: https://github.com/siaarzh/scrybe/compare/v0.51.0...HEAD
+[Unreleased]: https://github.com/siaarzh/scrybe/compare/v0.52.0...HEAD
+[0.52.0]: https://github.com/siaarzh/scrybe/compare/v0.51.1...v0.52.0
+[0.51.1]: https://github.com/siaarzh/scrybe/compare/v0.51.0...v0.51.1
 [0.51.0]: https://github.com/siaarzh/scrybe/compare/v0.50.0...v0.51.0
 [0.50.0]: https://github.com/siaarzh/scrybe/compare/v0.49.0...v0.50.0
 [0.49.0]: https://github.com/siaarzh/scrybe/compare/v0.48.0...v0.49.0
 [0.48.0]: https://github.com/siaarzh/scrybe/compare/v0.47.1...v0.48.0
-[0.47.1]: https://github.com/siaarzh/scrybe/compare/v0.47.0...v0.47.1
-[0.47.0]: https://github.com/siaarzh/scrybe/compare/v0.46.3...v0.47.0
