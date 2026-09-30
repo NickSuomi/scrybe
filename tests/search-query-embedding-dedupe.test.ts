@@ -124,7 +124,7 @@ describe("searchCode query embedding fan-out", () => {
   it("keeps embeddings separate when only the response encoding changes", async () => {
     state.project = { id: "code-project", sources: [source("one", "code"), source("two", "code")] };
     state.configs.set("one", embeddingConfig({ encoding_format: "float" }));
-    state.configs.set("two", embeddingConfig({ encoding_format: "base64" }));
+    state.configs.set("two", embeddingConfig());
 
     const { searchCode } = await import("../src/search.js");
     const { embedQuery } = await import("../src/embedder.js");
@@ -145,6 +145,22 @@ describe("searchCode query embedding fan-out", () => {
     await searchCode("find API authentication", "code-project");
 
     expect(embedQuery).toHaveBeenCalledTimes(2);
+  });
+
+  it("routes distinct same-dimension model vectors to their own source tables", async () => {
+    state.project = { id: "code-project", sources: [source("one", "code"), source("two", "code")] };
+    state.configs.set("one", embeddingConfig({ model: "model-one" }));
+    state.configs.set("two", embeddingConfig({ model: "model-two" }));
+    const { embedQuery } = await import("../src/embedder.js");
+    vi.mocked(embedQuery).mockImplementationOnce(async () => [1, 0]).mockImplementationOnce(async () => [0, 1]);
+    const { searchCode } = await import("../src/search.js");
+    const { search } = await import("../src/vector-store.js");
+
+    await searchCode("find API authentication", "code-project");
+
+    expect(embedQuery).toHaveBeenCalledTimes(2);
+    expect(search).toHaveBeenCalledWith([1, 0], "code-project", 10, "table_one", 1024, undefined);
+    expect(search).toHaveBeenCalledWith([0, 1], "code-project", 10, "table_two", 1024, undefined);
   });
 });
 

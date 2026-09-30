@@ -98,14 +98,17 @@ describe("OpenAI-compatible float embeddings", () => {
     expect(vector).toHaveLength(1024);
   });
 
-  it("treats an explicit base64 preset as the SDK default", async () => {
+  it.each([
+    ["base64 string", Buffer.alloc(3 * Float32Array.BYTES_PER_ELEMENT).toString("base64")],
+    ["string values", ["0.1", "0.2", "0.3", "0.4"]],
+    ["non-finite values", [0.1, null, 0.3, 0.4]],
+  ])("rejects %s when float output was requested", async (_label, embedding) => {
     const server = http.createServer(async (_request, response) => {
-      const bytes = Buffer.alloc(1024 * Float32Array.BYTES_PER_ELEMENT);
       response.writeHead(200, { "Content-Type": "application/json" });
       response.end(JSON.stringify({
         object: "list",
-        data: [{ object: "embedding", index: 0, embedding: bytes.toString("base64") }],
-        model: "voyage-compatible",
+        data: [{ object: "embedding", index: 0, embedding }],
+        model: "local-qwen",
         usage: { prompt_tokens: 1, total_tokens: 1 },
       }));
     });
@@ -115,15 +118,38 @@ describe("OpenAI-compatible float embeddings", () => {
     const { port } = server.address() as AddressInfo;
     process.env[API_KEY_ENV] = "not-needed";
     const { embedQuery } = await import("../src/embedder.js");
-    const vector = await embedQuery("synthetic query", {
+    await expect(embedQuery("synthetic query", {
       base_url: `http://127.0.0.1:${port}/v1`,
-      model: "voyage-compatible",
+      model: "local-qwen",
+      dimensions: embedding.length,
+      api_key_env: API_KEY_ENV,
+      provider_type: "api",
+      encoding_format: "float",
+    })).rejects.toThrow(/encoding_format.*float.*numeric|numeric.*encoding_format.*float/i);
+  });
+
+  it("suggests float encoding when the SDK decodes a float array to one quarter of its dimensions", async () => {
+    const server = http.createServer(async (_request, response) => {
+      response.writeHead(200, { "Content-Type": "application/json" });
+      response.end(JSON.stringify({
+        object: "list",
+        data: [{ object: "embedding", index: 0, embedding: Array(1024).fill(0) }],
+        model: "local-qwen",
+        usage: { prompt_tokens: 1, total_tokens: 1 },
+      }));
+    });
+    servers.push(server);
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+
+    const { port } = server.address() as AddressInfo;
+    process.env[API_KEY_ENV] = "not-needed";
+    const { embedQuery } = await import("../src/embedder.js");
+    await expect(embedQuery("synthetic query", {
+      base_url: `http://127.0.0.1:${port}/v1`,
+      model: "local-qwen",
       dimensions: 1024,
       api_key_env: API_KEY_ENV,
       provider_type: "api",
-      encoding_format: "base64",
-    });
-
-    expect(vector).toHaveLength(1024);
+    })).rejects.toThrow(/256d.*1024d.*encoding_format.*float.*before.*dimensions/i);
   });
 });

@@ -307,6 +307,87 @@ describe("synthesizeWizardConfig — custom response encoding", () => {
   });
 });
 
+describe("runWizard — custom endpoint detection", () => {
+  let dir: string;
+  const cancelled = Symbol("cancelled");
+
+  beforeEach(() => {
+    dir = makeTempDir();
+    process.env["SCRYBE_DATA_DIR"] = dir;
+  });
+
+  afterEach(() => {
+    vi.doUnmock("@clack/prompts");
+    vi.unstubAllGlobals();
+    delete process.env["SCRYBE_DATA_DIR"];
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  function mockPrompts() {
+    const prompts = {
+      intro: vi.fn(),
+      cancel: vi.fn(),
+      isCancel: (value: unknown) => value === cancelled,
+      text: vi.fn(async ({ message }: { message: string }) => {
+        if (message.startsWith("Custom API base URL")) return "http://127.0.0.1:11480/v1";
+        throw new Error(`Unexpected prompt: ${message}`);
+      }),
+      password: vi.fn().mockResolvedValue("not-needed"),
+      select: vi.fn()
+        .mockResolvedValueOnce("custom")
+        .mockResolvedValueOnce("local-qwen")
+        .mockResolvedValueOnce("local")
+        .mockResolvedValueOnce("Xenova/multilingual-e5-small")
+        .mockResolvedValueOnce(cancelled),
+      confirm: vi.fn(async ({ message }: { message: string }) => {
+        throw new Error(`Unexpected confirmation: ${message}`);
+      }),
+      spinner: () => ({ start: vi.fn(), stop: vi.fn() }),
+      log: { success: vi.fn(), warn: vi.fn() },
+    };
+    vi.doMock("@clack/prompts", () => prompts);
+    return prompts;
+  }
+
+  it("saves probed dimensions and float encoding without asking users to guess them", async () => {
+    mockPrompts();
+    const probeBodies: object[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (url: string, options?: RequestInit) => {
+      if (url.endsWith("/models")) {
+        return { ok: true, status: 200, json: async () => ({ data: [{ id: "local-qwen" }] }) };
+      }
+      probeBodies.push(JSON.parse(options!.body as string));
+      return { ok: true, status: 200, json: async () => ({ data: [{ embedding: [0.1, 0.2, 0.3, 0.4] }] }) };
+    }));
+    const { runWizard } = await import("../src/onboarding/wizard.js");
+
+    await runWizard();
+
+    const config = JSON.parse(readFileSync(join(dir, "config.json"), "utf8"));
+    expect(config.embedding_presets[config.assignments.code_preset]).toMatchObject({
+      provider: "custom", model: "local-qwen", dim: 4, encoding_format: "float",
+    });
+    expect(probeBodies).toEqual([{ model: "local-qwen", input: ["ping"], encoding_format: "float" }]);
+  });
+
+  it("leaves config unwritten when the custom endpoint ignores the float request", async () => {
+    const prompts = mockPrompts();
+    vi.stubGlobal("fetch", vi.fn(async (url: string) => ({
+      ok: true,
+      status: 200,
+      json: async () => url.endsWith("/models")
+        ? { data: [{ id: "local-qwen" }] }
+        : { data: [{ embedding: Buffer.alloc(16).toString("base64") }] },
+    })));
+    const { runWizard } = await import("../src/onboarding/wizard.js");
+
+    await runWizard();
+
+    expect(prompts.log.warn.mock.calls[0][0]).toMatch(/encoding_format.*float.*numeric|numeric.*encoding_format.*float/i);
+    expect(existsSync(join(dir, "config.json"))).toBe(false);
+  });
+});
+
 // ─── Doctor checks ────────────────────────────────────────────────────────────
 
 describe("doctor — config.well_formed: malformed config.json", () => {
